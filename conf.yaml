@@ -1,0 +1,13 @@
+port: 10000
+addr: "172.31.0.10"
+interface: "ens5"
+sniMappings:
+    - fqdn: "sni.test.123.com"
+      ipv4: "172.31.33.242"
+      port: 10000
+    - fqdn: "test123.com"
+      ipv4: "1.2.3.4"
+      port: 10001
+    - fqdn: "boom.com"
+      port: 10000
+      ipv4: "172.31.33.242"
