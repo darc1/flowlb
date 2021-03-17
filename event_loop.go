@@ -1,4 +1,4 @@
-package main
+package lb
 
 import (
   "fmt"
@@ -7,16 +7,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-type udpEvent struct {
-  SrcMac  [6]byte
-  DstMac  [6]byte
-	SrcAddr [4]byte
-	SrcPort uint16
-	DstAddr [4]byte
-	DstPort uint16
-	Message [128]byte
-	Code    int32
-}
+
 
 func MACStr(arr [6]byte) string{
   return fmt.Sprintf("%x:%x:%x:%x:%x:%x",
@@ -24,7 +15,7 @@ func MACStr(arr [6]byte) string{
 }
 
 func ReadBpfEvents(channel <-chan []byte) {
-	var message udpEvent
+	var message XdpEvent
 	for {
 		data := <-channel
 		err := binary.Read(bytes.NewBuffer(data), binary.BigEndian, &message)

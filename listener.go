@@ -1,13 +1,13 @@
-package main
+package lb
 
 import (
+	"errors"
 	"fmt"
 	"net"
-	"syscall"
+	"strings"
+	"sync"
 	"time"
 	"unsafe"
-
-	byteorder "github.com/moolen/udplb/byteorder"
 
 	bpf "github.com/iovisor/gobpf/bcc"
 	log "github.com/sirupsen/logrus"
@@ -16,26 +16,9 @@ import (
 type ListenerParams struct {
 	Port        uint16
 	ListenAddr  net.IP
-	SniMappings map[string]*net.UDPAddr
-	Redirects   *bpf.Table
-	SourceNat   *bpf.Table
-}
-
-type UDPRedirect struct {
-	dstAddr [4]byte
-	dstPort [2]byte
-	srcAddr [4]byte
-	srcPort [2]byte
-}
-
-type DtlsConn struct {
-	packets    [][]byte
-	clientAddr *net.UDPAddr
-	dstAddr    *net.UDPAddr
-	natConn    *net.UDPConn
-	listenAddr *net.UDPAddr
-	snatAddr   *net.UDPAddr
-	timestamp  int64
+	Flows   *bpf.Table
+	FlowMapper  FlowMapper
+	ConnTracker *ConnTracker
 }
 
 type Flow struct {
@@ -43,159 +26,139 @@ type Flow struct {
 	DstAddr *net.UDPAddr
 }
 
-type FlowMapper interface {
-	FindFlow(srcAddr *net.UDPAddr, srcPackets [][]byte) (*Flow, error)
+type ConnTracker struct {
+	Conns *sync.Map
 }
 
-//func SetSocketOptions(network string, address string, c syscall.RawConn) error {
-//
-//	var fn = func(s uintptr) {
-//		var setErr error
-//		var getErr error
-//		setErr = syscall.SetsockoptInt(int(s), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
-//		if setErr != nil {
-//			log.Fatal(setErr)
-//		}
-//
-//		val, getErr := syscall.GetsockoptInt(int(s), syscall.SOL_IP, syscall.IP_TRANSPARENT)
-//		if getErr != nil {
-//			log.Fatal(getErr)
-//		}
-//		log.Printf("value of IP_TRANSPARENT option is: %d", int(val))
-//	}
-//	if err := c.Control(fn); err != nil {
-//		return err
-//	}
-//
-//	return nil
-//
-//}
-
-func SetSocketOptions(network string, address string, c syscall.RawConn) error {
-
-	var fn = func(s uintptr) {
-		var setErr error
-		var getErr error
-		setErr = syscall.SetsockoptInt(int(s), syscall.SOL_IP, syscall.SO_REUSEADDR, 1)
-		if setErr != nil {
-			log.Fatal(setErr)
-		}
-
-		val, getErr := syscall.GetsockoptInt(int(s), syscall.SOL_IP, syscall.SO_REUSEADDR)
-		if getErr != nil {
-			log.Fatal(getErr)
-		}
-		log.Printf("value of IP_TRANSPARENT option is: %d", int(val))
-	}
-	if err := c.Control(fn); err != nil {
-		return err
+func (tracker *ConnTracker) newConn(key net.Addr, listenAddr *net.UDPAddr) *TrackedConn {
+	trackedConn := &TrackedConn{
+		packets:    make([][]byte, 0),
+		clientAddr: toUDPAddr(key),
+		listenAddr: listenAddr,
+		timestamp:  time.Now().UnixNano(),
 	}
 
+	tracker.Conns.Store(key, trackedConn)
+	return trackedConn
+}
+
+func (tracker *ConnTracker) findConn(key net.Addr) *TrackedConn {
+	conn, ok := tracker.Conns.Load(key)
+	if !ok {
+		return nil
+	}
+
+	return conn.(*TrackedConn)
+}
+
+func (tracker *ConnTracker) appendPacket(key net.Addr, packet []byte) error {
+	conn := tracker.findConn(key)
+	if conn == nil {
+		return errors.New(fmt.Sprintf("Conn %s doesn't exists", key))
+	}
+
+	conn.packets = append(conn.packets, packet)
 	return nil
-
 }
-//func sendAllBuffered(dtlsConn *DtlsConn) {
-//	lc := net.ListenConfig{Control: SetSocketOptions}
-//
-//	listener, err := lc.ListenPacket(context.Background(), "udp", dtlsConn.clientAddr.String())
-//	if err != nil {
-//		log.Fatalf("failed to create listener: %s", err)
-//		return
-//	}
-//	defer listener.Close()
-//
-//	for _, buf := range dtlsConn.packets {
-//		listener.WriteTo(buf, dtlsConn.dstAddr)
-//	}
-//}
 
-func sendAllBuffered(dtlsConn *DtlsConn) {
-	for _, buf := range dtlsConn.packets {
-		dtlsConn.natConn.Write(buf)
+func (tracker *ConnTracker) String() string {
+	var sb strings.Builder
+	tracker.ForEach(func(key net.Addr, val *TrackedConn) bool {
+		sb.WriteString(val.String())
+		sb.WriteString("\n")
+		return true
+	})
+
+	return sb.String()
+}
+
+func (tracker *ConnTracker) ForEach(function func(key net.Addr, conn *TrackedConn) bool) {
+	tracker.Conns.Range(func(k, v interface{}) bool {
+		keyCast := k.(net.Addr)
+		connCast := v.(*TrackedConn)
+		return function(keyCast, connCast)
+	})
+}
+
+func (tracker *ConnTracker) deleteConn(key net.Addr) {
+	conn := tracker.findConn(key)
+	if conn != nil {
+		conn.Close()
+	}
+	tracker.Conns.Delete(key)
+}
+
+type FlowMapper interface {
+	FindFlow(srcAddr *net.UDPAddr, packets [][]byte) (*Flow, error)
+}
+
+func sendAllBuffered(trackedConn *TrackedConn) {
+	for _, buf := range trackedConn.packets {
+		trackedConn.natConn.Write(buf)
 	}
 
-	dtlsConn.packets = nil
+	trackedConn.packets = nil
 }
 
-func addRedirectsTableEntry(redirects *bpf.Table,
-	sourceNat *bpf.Table,
-	clientSrcAddr *net.UDPAddr,
-	listeningAddr *net.UDPAddr,
-	srcNatAddr *net.UDPAddr,
-	dstAddr *net.UDPAddr) {
+func addFlowsTableEntry(flows *bpf.Table, conn *TrackedConn) {
 
-	clientSrcPort := byteorder.Htons(uint16(clientSrcAddr.Port))
-	clientSrcIp := byteorder.HtonIP(clientSrcAddr.IP)
-	listeningAddrPort := byteorder.Htons(uint16(listeningAddr.Port))
-	listeningAddrIp := byteorder.HtonIP(listeningAddr.IP)
-	srcNatPort := byteorder.Htons(uint16(srcNatAddr.Port))
-	srcNatIp := byteorder.HtonIP(srcNatAddr.IP)
-	dstPort := byteorder.Htons(uint16(dstAddr.Port))
-	dstIp := byteorder.HtonIP(dstAddr.IP)
-
-	tableKey := UDPRedirect{srcAddr: clientSrcIp,
-		srcPort: clientSrcPort,
-		dstAddr: listeningAddrIp,
-		dstPort: listeningAddrPort}
-
-	dstAddrN := UDPRedirect{dstAddr: dstIp,
-		dstPort: dstPort,
-		srcAddr: srcNatIp,
-		srcPort: srcNatPort}
-
-	err := redirects.SetP(unsafe.Pointer(&tableKey), unsafe.Pointer(&dstAddrN))
+	tableKey, tableValue, err := conn.getFlowValues()
+	if err != nil {
+		log.Warnf("failed to create flows table key/value %s", err)
+		return
+	}
+	err = flows.SetP(unsafe.Pointer(tableKey), unsafe.Pointer(tableValue))
 
 	if err != nil {
-		log.Debugf("failed to update redirects table (%s -> %s) : %s", clientSrcAddr.String(), dstAddr.String(), err)
+		log.Debugf("failed to update flows table (%s -> %s) : %s", conn.clientAddr.String(), conn.dstAddr.String(), err)
+		return
 	} else {
-
-		log.Debugf("updated redirects table ((%s->%s) ---> (%s->%s))",
-			clientSrcAddr.String(), listeningAddr.String(), srcNatAddr.String(), dstAddr.String())
+		log.Debugf("updated flows table ((%s->%s) ---> (%s->%s))",
+			conn.clientAddr.String(), conn.listenAddr.String(), conn.snatAddr.String(), conn.dstAddr.String())
 	}
 
-	natTableKey := UDPRedirect{
-		srcAddr: srcNatIp,
-		srcPort: srcNatPort,
-		dstAddr: dstIp,
-		dstPort: dstPort,
+	natTableKey, natTableValue, err := conn.getSrcNatValues()
+	if err != nil {
+		log.Warnf("failed to create flows nat table key/values %s", err)
+		return
 	}
-
-	natTableEntry := UDPRedirect{
-		srcAddr: listeningAddrIp,
-		srcPort: listeningAddrPort,
-		dstAddr: clientSrcIp,
-		dstPort: clientSrcPort,
-	}
-	err = sourceNat.SetP(unsafe.Pointer(&natTableKey), unsafe.Pointer(&natTableEntry))
+	err = flows.SetP(unsafe.Pointer(natTableKey), unsafe.Pointer(natTableValue))
 
 	if err != nil {
-		log.Debugf("failed to update nat table (%s -> %s) : %s", srcNatAddr.String(), dstAddr.String(), err)
+		log.Debugf("failed to update flows nat table (%s -> %s) : %s", conn.snatAddr.String(), conn.dstAddr.String(), err)
 	} else {
 
-		log.Debugf("updated nat table ((%s->%s) ---> (%s->%s))",
-			clientSrcAddr.String(), listeningAddr.String(), srcNatAddr.String(), dstAddr.String())
+		log.Debugf("updated flows nat table ((%s->%s) ---> (%s->%s))",
+			conn.clientAddr.String(), conn.listenAddr.String(), conn.snatAddr.String(), conn.dstAddr.String())
 	}
 }
 
-func forwardPackets(conn *DtlsConn, redirects *bpf.Table, sourceNat *bpf.Table) {
-    soc, err := net.DialUDP("udp", nil, conn.dstAddr)
-		if err != nil {
-			log.Errorf("failed to open UDP connection to: %s", conn.dstAddr)
-	    return
-		}
-	  log.Debugf("opened socket from: %s to %s", soc.LocalAddr().String(), conn.dstAddr.String())
-		conn.natConn = soc
-		conn.snatAddr = toUDPAddr(soc.LocalAddr())
-	addRedirectsTableEntry(redirects, sourceNat, conn.clientAddr, conn.listenAddr, conn.snatAddr, conn.dstAddr)
+func forwardPackets(conn *TrackedConn, flows *bpf.Table,  socketAllocator SocketAllocator) {
+	soc, err := socketAllocator.Allocate(conn.dstAddr)
+	if err != nil {
+		log.Errorf("failed to open UDP connection to: %s, %s", conn.dstAddr, err)
+		return
+	}
+	log.Debugf("opened socket from: %s to %s", soc.LocalAddr().String(), conn.dstAddr.String())
+	conn.natConn = soc
+	conn.snatAddr = soc.LocalAddr()
+	err = conn.setByteOrderedValues()
+	if err != nil {
+		log.Warnf("failed to set byteordered values on conn")
+	}
+
+	addFlowsTableEntry(flows, conn)
 	sendAllBuffered(conn)
 }
 
-func processPacket(conn *DtlsConn, flowMapper FlowMapper, redirects *bpf.Table, sourceNat *bpf.Table) {
+func processPacket(conn *TrackedConn, flowMapper FlowMapper, flows *bpf.Table, socketAllocator SocketAllocator) {
+  start := time.Now()
 	addr := conn.clientAddr
 	packets := conn.packets
 
 	flow, err := flowMapper.FindFlow(addr, packets)
-	if err != nil {
+  flowTime := time.Since(start)
+  if err != nil {
 		log.Errorf("failed to parse conn: %s", err)
 		return
 	}
@@ -206,24 +169,22 @@ func processPacket(conn *DtlsConn, flowMapper FlowMapper, redirects *bpf.Table, 
 	}
 
 	conn.dstAddr = flow.DstAddr
-	go forwardPackets(conn, redirects, sourceNat)
+  forwardStart := time.Now()
+	forwardPackets(conn, flows, socketAllocator)
+  log.Infof("packet from: %s processing time total=%s, flow=%s, forwarding=%s", conn.clientAddr, time.Since(start), flowTime, time.Since(forwardStart))
 }
 
-func toUDPAddr(addr net.Addr) *net.UDPAddr {
-	return &net.UDPAddr{IP: addr.(*net.UDPAddr).IP,
-		Port: addr.(*net.UDPAddr).Port}
-}
-
-func DtlsClientHelloParser(conf ListenerParams) {
-	flowMapper := &SNIFlowMapper{SniMappings: conf.SniMappings}
-	listenAddr := fmt.Sprintf("%s:%d", conf.ListenAddr.String(), conf.Port)
-	conn, err := net.ListenPacket("udp", listenAddr)
+func Listen(conf ListenerParams) {
+	flowMapper := conf.FlowMapper
+	connTracker := conf.ConnTracker
+	socketAllocator := NewFlowSocketAllocator(&conf.ListenAddr)
+	listenAddr := &net.UDPAddr{IP: conf.ListenAddr, Port: int(conf.Port)}
+	conn, err := net.ListenPacket("udp", listenAddr.String())
 	if err != nil {
 		log.Fatalf("failed to start local server. %s\n", err)
 	}
 
 	defer conn.Close()
-	conns := make(map[net.Addr]*DtlsConn)
 	for {
 		buf := make([]byte, 1526)
 		count, addr, err := conn.ReadFrom(buf)
@@ -233,21 +194,16 @@ func DtlsClientHelloParser(conf ListenerParams) {
 		}
 
 		buf = buf[0:count]
-		log.Debugf("got %d:%d bytes from: %s. \nconns:%s\n", count, len(buf), addr.String(), conns)
-		_, ok := conns[addr]
-		if !ok {
+		log.Debugf("got %d bytes from: %s.", count, addr.String())
+		conn := connTracker.findConn(addr)
+		if conn == nil {
 			log.Debugf("no connection found for addr: %s", addr.String())
-			dtlsConn := &DtlsConn{
-				packets:    make([][]byte, 0),
-				clientAddr: toUDPAddr(addr),
-				listenAddr: &net.UDPAddr{IP: conf.ListenAddr, Port: int(conf.Port)},
-				timestamp:  time.Now().UnixNano(),
-			}
-			conns[addr] = dtlsConn
+			conn = connTracker.newConn(addr, listenAddr)
 		}
-		log.Debugf("connections: %s", conns)
 
-		conns[addr].packets = append(conns[addr].packets, buf)
-		go processPacket(conns[addr], flowMapper, conf.Redirects, conf.SourceNat)
+		log.Debugf("connections: %s", connTracker)
+
+		connTracker.appendPacket(addr, buf)
+		go processPacket(connTracker.findConn(addr), flowMapper, conf.Flows,  &socketAllocator)
 	}
 }

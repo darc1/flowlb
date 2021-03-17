@@ -1,10 +1,9 @@
-package main
+package lb
 
 import (
 	bpf "github.com/iovisor/gobpf/bcc"
 	log "github.com/sirupsen/logrus"
-	"github.com/vishvananda/netlink"
-	"udplb/byteorder"
+	byteorder "github.com/moolen/udplb/byteorder"
 )
 
 /*
@@ -16,59 +15,7 @@ void perf_reader_free(void *ptr);
 */
 import "C"
 
-func LoadTcModule(fileName string, linkName string) *bpf.Module {
-
-	source, err := Asset(fileName)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	llvmArgs := []string{"-w"}
-	if debug == true {
-		llvmArgs = append(llvmArgs, "-DDEBUG=1")
-		log.SetLevel(log.DebugLevel)
-	}
-
-	log.Info("loading bpf module.")
-	module := bpf.NewModule(string(source), llvmArgs)
-
-	log.Info("loading net module type=BPF_PROG_TYPE_SCHED_ACT\n")
-	fd, err := module.LoadNet("forwarder")
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Infof("fetch link: %s\n", linkName)
-	link, err := netlink.LinkByName(linkName)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = createQdisc(link)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = createFilter(fd, "forwarder", link, netlink.HANDLE_MIN_INGRESS)
-	//err = createFilter(fd, "forwarder", link, netlink.HANDLE_MIN_INGRESS)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return module
-
-}
-
-func CloseTcModule(module *bpf.Module, linkName string) {
-	link, err := netlink.LinkByName(linkName)
-	if err != nil {
-		log.Error(err)
-	} else {
-		deleteQdisc(link)
-	}
-	module.Close()
-}
-
-func LoadXdpModule(fileName string, link_name string) *bpf.Module {
+func LoadXdpModule(fileName string, link_name string, debug bool) *bpf.Module {
 
 	source, err := Asset(fileName)
 	if err != nil {
@@ -117,13 +64,10 @@ func CreatePortsTable(listeningPorts []uint16, module *bpf.Module) {
 
 }
 
-func CreateRedirectsTable(module *bpf.Module) *bpf.Table {
-	return bpf.NewTable(module.TableId("redirects"), module)
+func CreateFlowsTable(module *bpf.Module) *bpf.Table {
+	return bpf.NewTable(module.TableId("flows"), module)
 }
 
-func CreateSrcNatTable(module *bpf.Module) *bpf.Table {
-	return bpf.NewTable(module.TableId("src_nat"), module)
-}
 
 func CreateEventChannels(module *bpf.Module, tableName string) (chan []byte, *bpf.PerfMap) {
 	table := bpf.NewTable(module.TableId(tableName), module)
